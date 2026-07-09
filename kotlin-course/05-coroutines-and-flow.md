@@ -1,27 +1,30 @@
 # 05 · Coroutines & Flow
 
-> **Goal:** understand Kotlin's concurrency model — the thing that lets the server handle many
-> players on few threads and lets Compose react to changing state. We cover **suspension vs
-> blocking**, **structured concurrency**, `launch`/`async`/`Job`, cancellation, and the streaming
-> types (`Channel`, `Flow`, `StateFlow`). This directly explains the server's `for (frame in
-> incoming)` WebSocket loop.
+Coroutines are the piece of Kotlin that most directly shapes this project. They're what let one modest
+server hold thousands of players on a handful of threads, and they're the machinery under Compose
+reacting to changing state. The good news is that the whole subject is built on a single language
+feature — the `suspend` keyword — with a library (`kotlinx.coroutines`) layered on top. Ktor bundles
+that library; to play with it standalone you'd add `kotlinx-coroutines-core`. We'll start from the
+problem coroutines solve, build up through the tools, and end at the streaming types that carry game
+state between the server and each client.
 
 ← [04 · Functions & DSLs](04-functions-lambdas-dsl.md) · next → [06 · Gradle & ecosystem](06-gradle-and-ecosystem.md)
-
-Coroutines are a **library** (`kotlinx.coroutines`) built on one **language** feature: the `suspend`
-keyword. Ktor bundles it; to experiment standalone, add `kotlinx-coroutines-core`.
 
 ---
 
 ## 1. The problem: waiting without wasting a thread
 
-A real-time game spends most of its life **waiting** — for a player's move, a network frame, a timer.
-The naive approach dedicates one OS **thread** per waiting task. Threads are expensive (~1 MB of
-stack each, OS-scheduled), so a few thousand waiting players would sink the server.
+A real-time game spends almost all of its life *waiting* — for a player to make a move, for a network
+frame to arrive, for a timer to fire. The obvious way to handle a waiting task is to give it a thread
+and let that thread block until the wait is over. The trouble is that threads are expensive: each one
+carries around a megabyte or so of stack and is scheduled by the operating system, so a few thousand
+players all sitting idle would sink the server under the weight of threads that are doing nothing but
+waiting.
 
-A **coroutine** is a *suspendable computation*: when it hits a waiting point it **suspends** —
-releases its thread so other coroutines can run — and **resumes** later on some thread when the wait
-is over. Thousands of suspended coroutines can share a handful of threads.
+A coroutine is the way out. Think of it as a *suspendable* computation: when it reaches a point where
+it has to wait, it *suspends* — it releases its thread so other work can use it — and later, when the
+wait is over, it *resumes*, possibly on a different thread. Because a suspended coroutine isn't holding
+a thread, thousands of them can share a small pool.
 
 ```
 BLOCKING (1 thread held while waiting)      SUSPENDING (thread freed while waiting)
@@ -30,16 +33,18 @@ BLOCKING (1 thread held while waiting)      SUSPENDING (thread freed while waiti
   ...one thread stuck per waiter...                       thread for B; resumes when ready
 ```
 
-> **The core distinction (memorize):** *blocking* keeps a thread occupied and idle. *Suspending*
-> frees the thread to do other work and comes back later. Same waiting, vastly better resource use.
+The distinction to hold onto is exactly this: *blocking* keeps a thread occupied while it sits idle,
+whereas *suspending* frees the thread to do other work and comes back later. The waiting is the same
+either way; the resource cost is not remotely the same.
 
 ---
 
 ## 2. `suspend` functions
 
-A function marked **`suspend`** may suspend. It can only be called from another `suspend` function or
-from a coroutine builder — this "coloring" is the compiler ensuring suspension only happens where the
-machinery exists.
+A function marked `suspend` is one that's allowed to suspend. The rule that comes with that permission
+is that a `suspend` function can only be called from another `suspend` function or from a coroutine
+builder — this is the "coloring" you may have heard grumbling about, and it's really the compiler making
+sure suspension only happens where the machinery to handle it exists.
 
 ```kotlin
 suspend fun fetchMove(): Tile {
@@ -48,10 +53,13 @@ suspend fun fetchMove(): Tile {
 }
 ```
 
-Under the hood (from [Chapter 02](02-kotlin-to-bytecode.md#8-suspend-preview--an-extra-continuation-parameter--a-state-machine)):
-the compiler adds a hidden **`Continuation`** parameter and rewrites the body into a **state machine**.
-Each suspension point is a state; suspending returns control, and resuming re-enters the method at the
-saved state. No thread is parked — it's just a method that can pause and continue.
+You already saw the mechanism in miniature back in
+[Chapter 02](02-kotlin-to-bytecode.md#8-suspend-preview--an-extra-continuation-parameter--a-state-machine):
+the compiler slips in a hidden `Continuation` parameter and rewrites the body into a state machine.
+Each suspension point is a state; suspending hands control back and returns the thread, and resuming
+re-enters the method at the state it saved. No thread is parked anywhere — it's genuinely just a method
+that can pause and later continue. The `delay(500)` above is the tell: it's not `Thread.sleep`, which
+would block; it suspends, and the thread goes off to run something else for those 500 milliseconds.
 
 ```mermaid
 sequenceDiagram
@@ -69,15 +77,17 @@ sequenceDiagram
 
 ## 3. Coroutine builders: `launch`, `async`, `runBlocking`
 
-You start coroutines with **builders**, inside a **scope** (next section):
+You don't call a `suspend` function out of thin air; you start a coroutine with a *builder*, inside a
+*scope* (which the next section covers). Three builders cover almost everything. `launch { }` starts a
+coroutine that does work but produces no value, and hands you back a `Job` — a handle you can use to
+cancel or wait on it; think of it as "fire and manage." `async { }` starts a coroutine that computes a
+value and hands you a `Deferred<T>`, whose `.await()` (itself a `suspend` function) gives you the
+result once it's ready; that's the tool for running computations concurrently. And `runBlocking { }` is
+the bridge from ordinary blocking code into coroutine-land: it blocks the current thread until
+everything inside finishes, which is exactly what you want in `main()` or a test and exactly what you
+don't want inside code that's already asynchronous.
 
-- **`launch { }`** — start a coroutine that does work but returns no value. Returns a **`Job`** (a
-  handle to cancel/join it). "Fire and manage."
-- **`async { }`** — start a coroutine that computes a value. Returns a **`Deferred<T>`**; call
-  **`.await()`** (a `suspend` fun) to get the result. Use for concurrent computations.
-- **`runBlocking { }`** — the bridge from *ordinary* blocking code into coroutine-land: it **blocks
-  the current thread** until the coroutines inside finish. Use it in `main()` and tests, *not* inside
-  already-async code.
+Seeing them interact makes the timing concrete:
 
 ```kotlin
 import kotlinx.coroutines.*
@@ -98,10 +108,11 @@ fun main() = runBlocking {              // bridge: blocks main thread until this
 
 ## 4. Structured concurrency (the safety model)
 
-The rule that makes coroutines *safe*: **every coroutine runs in a `CoroutineScope`, and coroutines
-form a parent→child tree with linked lifecycles.** A parent does not complete until all its children
-complete; if the parent is cancelled or fails, **all children are cancelled** too. No leaked
-"zombie" tasks.
+The idea that makes coroutines *safe* rather than a new way to leak background tasks is structured
+concurrency. Every coroutine runs inside a `CoroutineScope`, and coroutines form a parent-and-child
+tree with linked lifetimes. A parent doesn't consider itself finished until all its children have
+finished, and if the parent is cancelled or fails, all of its children are cancelled with it. There are
+no orphaned "zombie" tasks quietly running after the thing that started them is gone.
 
 ```mermaid
 flowchart TB
@@ -114,12 +125,12 @@ flowchart TB
     P -. .-> C3
 ```
 
-Two structured builders you'll use:
-
-- **`coroutineScope { }`** — a `suspend` block that starts children and **waits for all of them**; if
-  any child fails, it cancels the siblings and rethrows. "All-or-nothing."
-- **`supervisorScope { }`** — like `coroutineScope`, but a failing child does **not** cancel its
-  siblings. Ideal for a server game room: if one player's coroutine throws, the others keep playing.
+Two builders put this to work, and the difference between them matters for a game server. `coroutineScope { }`
+is a `suspend` block that launches children and waits for all of them; if any child fails, it cancels
+the siblings and rethrows — all-or-nothing. `supervisorScope { }` is the same shape, except a failing
+child does *not* drag its siblings down. That second one is the right model for a room full of players:
+if one player's coroutine throws, you want the others to keep playing rather than have the whole room
+collapse.
 
 ```kotlin
 suspend fun playRoom() = supervisorScope {
@@ -128,14 +139,15 @@ suspend fun playRoom() = supervisorScope {
 }
 ```
 
-This is exactly the model to use on the server: a room owns a scope; per-connection coroutines are
-its children.
+This is precisely the arrangement to reach for on the server: a room owns a scope, and each connection's
+coroutine is one of that scope's children.
 
 ---
 
 ## 5. Dispatchers: which thread(s) a coroutine uses
 
-A **dispatcher** decides the thread pool a coroutine runs on (part of its `CoroutineContext`):
+A coroutine still has to run on a real thread eventually, and a *dispatcher* decides which pool of
+threads that is — it's part of the coroutine's context. Three cover the common cases:
 
 | Dispatcher | For | Notes |
 |------------|-----|-------|
@@ -143,50 +155,58 @@ A **dispatcher** decides the thread pool a coroutine runs on (part of its `Corou
 | `Dispatchers.IO` | blocking I/O (JDBC, files) | large elastic pool; wrap blocking calls here |
 | `Dispatchers.Main` | Android UI updates | the single UI thread (Compose/Views) |
 
-Rule: **never do blocking or heavy work on `Main`** (freezes the UI) — offload with
-`withContext(Dispatchers.IO) { blockingCall() }`. On the server, wrap JDBC/file calls in
-`Dispatchers.IO` so you don't starve the request threads.
+The rule that keeps you out of trouble is to never do blocking or heavy work on `Main`, because that's
+the one thread drawing the UI and blocking it freezes the app. When you must make a blocking call,
+push it off with `withContext(Dispatchers.IO) { blockingCall() }`. The same instinct applies on the
+server: wrap JDBC or file calls in `Dispatchers.IO` so they don't starve the threads handling requests.
 
 ---
 
 ## 6. Cancellation
 
-Cancellation is **cooperative**: cancelling a `Job` sets a flag; suspension points (`delay`, I/O,
-`yield`) check it and throw `CancellationException` to unwind cleanly. A tight CPU loop with no
-suspension point won't notice — call `ensureActive()`/`yield()` in such loops. When a WebSocket
-disconnects, the coroutine reading it is cancelled, and structured concurrency tears down its
-children. This is why clean disconnect handling "just works" if you respect the scope.
+Cancellation in coroutines is *cooperative*, which is worth understanding because it explains a common
+surprise. Cancelling a `Job` doesn't forcibly kill anything; it sets a flag, and the suspension points
+— `delay`, I/O, `yield` — check that flag and throw a `CancellationException` to unwind cleanly. The
+consequence is that a tight CPU loop with no suspension point in it won't notice it's been cancelled at
+all, so in such a loop you call `ensureActive()` or `yield()` to give cancellation a chance to land.
+The payoff is that when a WebSocket disconnects and the coroutine reading it is cancelled, structured
+concurrency tears down its children automatically — which is why clean disconnect handling "just works"
+as long as you've respected the scope.
 
 ---
 
 ## 7. Streaming values: `Channel`, `Flow`, `StateFlow`
 
-A `suspend` function returns **one** value. For *streams* of values over time:
+A `suspend` function returns a single value. Games are made of *streams* of values over time — moves,
+state updates, events — so we need types for that, and there are three worth knowing, escalating from a
+plain queue up to the reactive state that drives the UI.
 
-- **`Channel<T>`** — a coroutine-safe queue: one coroutine `send`s, another `receive`s. **This is
-  exactly what a Ktor WebSocket's `incoming` is** — a `ReceiveChannel<Frame>`. That's why the server
-  can write `for (frame in incoming)`: iterating a channel **suspends** until the next frame arrives,
-  then resumes. Perfect for a message loop.
+The simplest is `Channel<T>`, a coroutine-safe queue: one coroutine `send`s, another `receive`s. This
+one isn't abstract for us at all, because a Ktor WebSocket's `incoming` *is* a `ReceiveChannel<Frame>`.
+That's the whole reason the server can be written as `for (frame in incoming)` — iterating a channel
+suspends until the next frame arrives, then resumes with it, which is exactly the message loop you want:
 
-  ```kotlin
-  // The real server code, now readable as "suspend until next frame, forever":
-  for (frame in incoming) {          // suspends here between messages — no thread blocked
-      if (frame is Frame.Text) { /* handle move */ }
-  }
-  ```
+```kotlin
+// The real server code, now readable as "suspend until next frame, forever":
+for (frame in incoming) {          // suspends here between messages — no thread blocked
+    if (frame is Frame.Text) { /* handle move */ }
+}
+```
 
-- **`Flow<T>`** — a *cold* asynchronous stream (like a lazy, suspendable sequence). Nothing runs until
-  someone `collect`s it. Great for "a stream of game states."
+Next up is `Flow<T>`, a *cold* asynchronous stream — think of it as a lazy, suspendable sequence.
+Nothing runs until someone `collect`s it, and each collector starts it afresh. It's the natural type
+for "a stream of game states" that a consumer pulls on demand:
 
-  ```kotlin
-  fun ticks(): Flow<Int> = flow { var i = 0; while (true) { emit(i++); delay(1000) } }
-  // consumer: ticks().collect { println(it) }   // 0,1,2,… one per second
-  ```
+```kotlin
+fun ticks(): Flow<Int> = flow { var i = 0; while (true) { emit(i++); delay(1000) } }
+// consumer: ticks().collect { println(it) }   // 0,1,2,… one per second
+```
 
-- **`StateFlow<T>` / `SharedFlow<T>`** — *hot* flows that broadcast to multiple collectors.
-  **`StateFlow`** always holds a current value (perfect for "current game state"); Compose can collect
-  it and recompose on change. **`SharedFlow`** broadcasts events to many subscribers (perfect for
-  fanning a move out to all players in a room).
+At the top of the escalation are the *hot* flows, which broadcast to multiple collectors at once.
+`StateFlow<T>` always holds a current value, which makes it the perfect home for "the current game
+state" — Compose can collect it and recompose whenever it changes. `SharedFlow<T>` broadcasts events to
+many subscribers without holding a single current value, which is what you want for fanning a move out
+to every player in a room.
 
 ```mermaid
 flowchart LR
@@ -196,33 +216,30 @@ flowchart LR
     SF --> BOT["bot collector → decides move"]
 ```
 
-**How this ties the whole app together:** the server keeps authoritative state and pushes updates via
-a `SharedFlow`/`Channel` to each connection; each Android client `collect`s server messages in a
-`ViewModel` and exposes a `StateFlow` that **Compose** observes to recompose the UI (next chapter's
-Compose section).
+Put those three together and you can see the whole app's nervous system. The server holds the
+authoritative state and pushes updates out through a `SharedFlow` or `Channel` to each connection; each
+Android client `collect`s the server's messages inside a `ViewModel` and re-exposes them as a
+`StateFlow`; and Compose observes that `StateFlow` and redraws the UI when it changes — which is exactly
+where the next chapter's Compose section picks up.
 
 ---
 
-## Recap
+Coroutines come down to one move made over and over: a coroutine *suspends* to free its thread instead
+of *blocking* it, which is the whole reason a waiting-heavy server can scale. Underneath, `suspend`
+compiles to a state machine with a hidden `Continuation`, and `delay` is not `Thread.sleep`. You start
+coroutines with `launch` (giving a `Job`) or `async` (giving a `Deferred` you `await`), and bridge in
+from blocking code with `runBlocking`. Structured concurrency ties coroutines into a scope-rooted tree
+so cancellation and failure propagate cleanly, with `supervisorScope` isolating sibling failures for a
+game room. Dispatchers pick the threads — `Default`, `IO`, `Main` — and the streaming types climb from
+`Channel` (which *is* the WebSocket `incoming`) through cold `Flow` to hot `StateFlow`/`SharedFlow`, the
+glue between server and app. Next we look at how Gradle assembles all of this into something runnable,
+and how Ktor and Compose are put together.
+→ [06 · Gradle & the build ecosystem](06-gradle-and-ecosystem.md)
 
-- A coroutine **suspends** (frees its thread) instead of **blocking** it — the key to scaling a
-  waiting-heavy server.
-- `suspend` compiles to a state machine with a hidden `Continuation`; `delay` ≠ `Thread.sleep`.
-- Start coroutines with `launch` (→ `Job`) / `async` (→ `Deferred.await()`); bridge from blocking code
-  with `runBlocking`.
-- **Structured concurrency**: coroutines form a parent/child tree in a `CoroutineScope`; cancellation
-  and failure propagate. `supervisorScope` isolates sibling failures (great for game rooms).
-- **Dispatchers** choose threads: `Default` (CPU), `IO` (blocking), `Main` (UI).
-- Streams: **`Channel`** (queue — *is* the WebSocket `incoming`), **`Flow`** (cold stream),
-  **`StateFlow`/`SharedFlow`** (hot; current-state / broadcast — the app↔server glue).
-
-**Sources:** [coroutines basics](https://kotlinlang.org/docs/coroutines-basics.html),
+*Further reading: [coroutines basics](https://kotlinlang.org/docs/coroutines-basics.html),
 [composing suspending functions](https://kotlinlang.org/docs/composing-suspending-functions.html),
-[coroutine context & dispatchers](https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html),
+[context & dispatchers](https://kotlinlang.org/docs/coroutine-context-and-dispatchers.html),
 [cancellation & timeouts](https://kotlinlang.org/docs/cancellation-and-timeouts.html),
 [asynchronous Flow](https://kotlinlang.org/docs/flow.html),
-[channels](https://kotlinlang.org/docs/channels.html),
-[Ktor WebSockets](https://ktor.io/docs/server-websockets.html).
-
-Next: how Gradle turns all this source into runnable artifacts, and how Ktor/Compose are assembled.
-→ [06 · Gradle & the build ecosystem](06-gradle-and-ecosystem.md)
+[channels](https://kotlinlang.org/docs/channels.html), and
+[Ktor WebSockets](https://ktor.io/docs/server-websockets.html).*
